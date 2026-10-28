@@ -26,7 +26,7 @@ import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
-import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
+import { ChildSessionFinalizationError, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
@@ -757,10 +757,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				});
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
+				if (childClosing.reason !== undefined) { settle(undefined, true); return; }
 				await created.prompt(input.prompt);
 				promptSettled = true;
 				settle(undefined);
 			} catch (promptError) {
+				if (promptError instanceof ChildSessionFinalizationError) recordFinalizationError(promptError);
 				promptSettled = true;
 				settle(promptError ?? new Error("Child session failed."));
 			}

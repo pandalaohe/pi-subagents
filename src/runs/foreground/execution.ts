@@ -106,7 +106,7 @@ import {
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
-import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
+import { ChildSessionFinalizationError, childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { createChildSessionClosing } from "../shared/child-session-closing.ts";
 import type { NativeCloseReason } from "../shared/native-child-lifecycle.ts";
@@ -1494,10 +1494,12 @@ async function runSingleAttempt(
 					},
 				});
 				messageBaseline = created.messages.length;
-				// A runtime replacement can stop a child that detached while it was still being created.
-				if (!hostStopReason) await created.prompt(`Task: ${task}`);
+				// Callbacks can close execution after the earlier startup check.
+				if (childClosing.reason !== undefined) { settle(undefined, true); return; }
+				await created.prompt(`Task: ${task}`);
 				settle(undefined);
 			} catch (error) {
+				if (error instanceof ChildSessionFinalizationError) recordFinalizationError(error);
 				settle(error ?? new Error("Child session failed."));
 			}
 		})();

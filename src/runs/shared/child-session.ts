@@ -23,6 +23,15 @@ import type { ChildRuntimeConfig } from "./child-runtime-config.ts";
 import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import type { HerdrMachineReference, HerdrRemoteGitStatus } from "../../shared/types.ts";
 
+/** Distinguish failed cleanup from an ordinary startup rejection or cancellation. */
+export class ChildSessionFinalizationError extends AggregateError {
+	constructor(failures: unknown[]) {
+		const errors = [...new Set(failures)];
+		super(errors, errors.map((error) => error instanceof Error ? error.message : String(error)).join("\n"));
+		this.name = "ChildSessionFinalizationError";
+	}
+}
+
 export interface ChildSessionEvent {
 	type: string;
 	[key: string]: unknown;
@@ -522,8 +531,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			// extensions loaded into it (ambient extensions included) release their
 			// watchers, servers, and timers. Do the same, then dispose.
 			const shutdownSession = async (session: Awaited<ReturnType<PiCodingAgentModule["createAgentSession"]>>["session"]): Promise<void> => {
+				const failures: unknown[] = [];
 				try {
 					await nativeLifecycle?.close("disposed");
+				} catch (error) {
+					failures.push(error);
 				} finally {
 					try {
 						await commands?.shutdown();
@@ -532,13 +544,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 							await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
 						}
 					} catch (error) {
-						launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
+						failures.push(error);
+						try { launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error }); }
+						catch (reportError) { failures.push(reportError); }
 					} finally {
-							removeStartupAbort();
-							if (nativeLifecycle) starting.delete(nativeLifecycle);
-						session.dispose();
+						removeStartupAbort();
+						if (nativeLifecycle) starting.delete(nativeLifecycle);
+						try { await session.dispose(); } catch (error) { failures.push(error); }
 					}
 				}
+				if (failures.length) throw new ChildSessionFinalizationError(failures);
 			};
 			let inheritedProviders = new Set<string>();
 			const open = async () => {
@@ -628,7 +643,9 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				return session;
 			};
 			const opened = loading.catch(() => {}).then(open).catch(async (error: unknown) => {
-				try { await nativeLifecycle?.close("fatal"); } finally { removeStartupAbort(); if (nativeLifecycle) starting.delete(nativeLifecycle); }
+				try { await nativeLifecycle?.close("fatal"); }
+				catch (closeError) { throw new ChildSessionFinalizationError(error instanceof ChildSessionFinalizationError ? [...error.errors, closeError] : [closeError]); }
+				finally { removeStartupAbort(); if (nativeLifecycle) starting.delete(nativeLifecycle); }
 				throw error;
 			});
 			loading = opened;
