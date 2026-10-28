@@ -571,6 +571,18 @@ async function runSingleAttempt(
 	const partialOutput = createPartialOutputTracker();
 	let childPromptFailed = false;
 	let finalizationError: string | undefined;
+	let attemptResultReturned = false;
+	const recordFinalizationError = (error: unknown): void => {
+		const message = error instanceof Error ? error.message : String(error);
+		if (attemptResultReturned) {
+			console.warn(`[pi-subagents] Late foreground child cleanup failed after completion: ${message}`);
+			return;
+		}
+		result.error = finalizationError = message;
+		result.exitCode = 1;
+		progress.status = "failed";
+		progress.error = message;
+	};
 	const exitCode = await new Promise<number>((resolve) => {
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, { pause() {}, resume() {} });
 		let session: ChildSession | undefined;
@@ -794,7 +806,7 @@ async function runSingleAttempt(
 					}
 				} finally { await session?.dispose(); }
 			}).catch((error) => {
-				result.error = finalizationError = error instanceof Error ? error.message : String(error);
+				recordFinalizationError(error);
 				code = 1;
 			}).then(() => {
 				resolve(code);
@@ -1430,7 +1442,8 @@ async function runSingleAttempt(
 				input.signal = startup.signal;
 				const created = await childSessions.create(input);
 				if (lifecycleFinished) {
-					void created.dispose();
+					try { await created.dispose(); }
+					catch (error) { recordFinalizationError(error); }
 					return;
 				}
 				session = created;
@@ -1467,7 +1480,7 @@ async function runSingleAttempt(
 			}
 		})();
 	});
-	result.exitCode = exitCode;
+	result.exitCode = finalizationError === undefined ? exitCode : 1;
 	if (afterCompactionSettlement) {
 		(result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT] = true;
 	}
@@ -1484,6 +1497,7 @@ async function runSingleAttempt(
 			tokens: progress.tokens,
 			durationMs: progress.durationMs,
 		};
+		attemptResultReturned = true;
 		return result;
 	}
 	if (progress.currentTool
@@ -1491,7 +1505,8 @@ async function runSingleAttempt(
 		&& !abortedBySignal
 		&& !result.timedOut
 		&& !result.stopped
-		&& !toolAvailabilityError) {
+		&& !toolAvailabilityError
+		&& finalizationError === undefined) {
 		result.exitCode = 1;
 		result.error = formatMidToolExitError({ toolName: progress.currentTool });
 	}
@@ -1641,6 +1656,7 @@ async function runSingleAttempt(
 			},
 		});
 	}
+	attemptResultReturned = true;
 	return result;
 }
 
