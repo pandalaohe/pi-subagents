@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-export type NativeCloseReason = "completed" | "fatal" | "disposed";
+const CLOSE_REASONS = ["completed", "fatal", "disposed", "stopped", "cancelled", "interrupted", "timeout", "tool-timeout", "hard-timeout"] as const;
+export type NativeCloseReason = typeof CLOSE_REASONS[number];
+
+export function nativeCloseReasonFromAbort(reason: unknown): NativeCloseReason {
+	return CLOSE_REASONS.find((cause) => cause === reason) ?? "cancelled";
+}
 export interface NativeClosing {
 	readonly reason: NativeCloseReason;
 	readonly generation: string;

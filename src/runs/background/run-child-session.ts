@@ -31,6 +31,8 @@ import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
+import { createChildSessionClosing } from "../shared/child-session-closing.ts";
+import type { NativeCloseReason } from "../shared/native-child-lifecycle.ts";
 
 export interface ChildEventContext {
 	runId: string;
@@ -194,6 +196,18 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let unsubscribe: (() => void) | undefined;
 		let settled = false;
 		let promptSettled = false;
+		let resultReported = false;
+		let finalizationError: string | undefined;
+		const childClosing = createChildSessionClosing();
+		let abortingChild: ChildSession | undefined;
+		const recordFinalizationError = (failure: unknown): void => {
+			const message = failure instanceof Error ? failure.message : String(failure);
+			if (resultReported) {
+				input.writeOutputLine(`[pi-subagents] Late background child cleanup failed after completion: ${message}`);
+				return;
+			}
+			finalizationError = finalizationError === undefined || finalizationError === message ? message : `${finalizationError}\n${message}`;
+		};
 		let forcedTermination = false;
 		let cleanTerminalAssistantStopReceived = false;
 		let agentSettledReceived = false;
@@ -252,14 +266,21 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		};
 
 		const startup = new AbortController();
-		const abortChild = (): void => {
+		const abortChild = (reason: NativeCloseReason = "fatal"): void => {
 			if (settled || promptSettled) return;
-			startup.abort();
+			const closing = childClosing.begin(reason);
+			startup.abort(childClosing.reason);
 			// MCP startup can now stop before a session is returned. The timer still bounds
 			// other creation work that does not observe the startup signal.
-			void session?.abort().catch(() => {
-				// The run settles through its prompt promise; abort failures are not separately actionable.
-			});
+			if (session && abortingChild !== session) {
+				const child = abortingChild = session;
+				void closing.then(() => child.abort(), (failure) => {
+					recordFinalizationError(failure);
+					return child.abort();
+				}).catch(() => {
+					// The run settles through its prompt promise; abort failures are not separately actionable.
+				});
+			}
 			if (!abortSettleTimer) {
 				abortSettleTimer = setTimeout(() => {
 					abortSettleTimer = undefined;
@@ -342,11 +363,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					armFinalDrainTimer();
 					return;
 				}
+				void childClosing.begin("hard-timeout");
 				forcedTermination = true;
 				if (!cleanTerminalAssistantStopReceived && !agentSettledReceived && !error && !assistantError) {
 					error = `Subagent session did not settle within ${FINAL_STOP_GRACE_MS}ms after its terminal event. Aborting it.`;
 				}
-				abortChild();
+				abortChild("hard-timeout");
 				finalHardFinishTimer = setTimeout(() => {
 					if (settled || promptSettled) return;
 					settle(undefined, true);
@@ -391,12 +413,13 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const clearAllToolTimeouts = (): void => {
 			for (const key of [...activeToolTimeouts.keys()]) removeToolTimeoutKey(key);
 		};
-		const terminateForTimeout = (message: string): void => {
+		const terminateForTimeout = (message: string, reason: NativeCloseReason = "timeout"): void => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			void childClosing.begin(reason);
 			timedOut = true;
 			interrupted = false;
 			error = message;
-			abortChild();
+			abortChild(reason);
 		};
 		const armToolTimeout = (event: { toolCallId?: unknown; toolName: string }): void => {
 			const timeoutForTool = effectiveToolTimeoutMs(event.toolName, input.toolTimeoutMs);
@@ -407,7 +430,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			const toolName = event.toolName;
 			const timer = setTimeout(() => {
 				removeToolTimeoutKey(key);
-				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool));
+				terminateForTimeout(formatToolTimeoutMessage(toolName, timeoutForTool), "tool-timeout");
 			}, timeoutForTool);
 			timer.unref?.();
 			activeToolTimeouts.set(key, { toolName, timer });
@@ -559,14 +582,17 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			input.registerStop?.(undefined);
 			input.registerSteer?.(undefined);
 			input.registerWatchdogStatus?.(undefined);
+			input.launch.session.signal?.removeEventListener("abort", cancel);
 			unsubscribe?.();
-			let commandError: string | undefined;
-			if (!interrupted && !timedOut && !stopped) {
-				try { await session?.finishCommands?.(); }
-				catch (error) { commandError = error instanceof Error ? error.message : String(error); }
+			try {
+				await childClosing.begin("completed");
+				if (!interrupted && !timedOut && !stopped) await session?.finishCommands?.();
+			} catch (failure) { recordFinalizationError(failure); }
+			finally {
+				try { await session?.dispose(); }
+				catch (failure) { recordFinalizationError(failure); }
 			}
-			await Promise.resolve().then(() => session?.dispose()).catch(() => undefined);
-			return commandError;
+			return finalizationError;
 		};
 
 		/** The child run ended (or was forced to end); fold in the outcome once the child's shutdown work is done. */
@@ -578,6 +604,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		const settle = (promptError: unknown, forced = false): void => {
 			if (settled) return;
 			settled = true;
+			void childClosing.begin(promptError !== undefined || error || assistantError ? "fatal" : "completed");
 			failUnconsumedSteers();
 			const terminalUsage = session && messageBaseline !== undefined
 				? reconcileAttemptUsage(usage, session.messages, messageBaseline)
@@ -618,8 +645,9 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				: interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal)
 					? 0
 					: finalError || promptError !== undefined ? 1 : 0;
-			void closed.then((commandError) => {
-				if (commandError) { finalError ??= commandError; exitCode = 1; }
+			void closed.then((finishError) => {
+				const cleanupError = finalizationError ?? finishError;
+				if (cleanupError !== undefined) { finalError = cleanupError; exitCode = 1; }
 				const result: RunChildSessionResult = omitUndefined({
 					exitCode,
 					messages,
@@ -628,7 +656,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					durationMs: Date.now() - startedAt,
 					model,
 					nativeMachine: session?.machineEvidence ? { provider: "herdr", machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
-					error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal && !commandError) ? undefined : finalError,
+					error: cleanupError ?? (stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal) ? undefined : finalError),
 					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
 					outputState: finalOutput.trim() ? "present" : "absent",
 					outputPartial: partialCause && streamedPartial ? true : undefined,
@@ -645,35 +673,55 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					currentPath,
 					afterCompactionSettlement: afterCompactionSettlement || undefined,
 				});
+				resultReported = true;
 				resolve(result);
 			});
 		};
 
 		input.registerInterrupt?.(() => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			void childClosing.begin("interrupted");
 			interrupted = true;
 			if (!error) error = "Interrupted. Waiting for explicit next action.";
-			abortChild();
+			abortChild("interrupted");
 		});
 		input.registerTimeout?.(() => terminateForTimeout(timeoutMessage()));
 		input.registerStop?.(() => {
 			if (settled || promptSettled || timedOut || stopped) return;
+			void childClosing.begin("stopped");
 			stopped = true;
 			interrupted = false;
 			error = stopMessage();
-			abortChild();
+			abortChild("stopped");
 		});
+		function cancel(): void {
+			if (settled || promptSettled || stopped || timedOut) return;
+			void childClosing.begin("cancelled");
+			stopped = true;
+			interrupted = false;
+			error = "Subagent cancelled.";
+			abortChild("cancelled");
+		}
+		if (input.launch.session.signal?.aborted) cancel();
+		else input.launch.session.signal?.addEventListener("abort", cancel, { once: true });
 
 		void (async () => {
 			try {
 				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
 				createInput.signal = startup.signal;
 				const created = await input.factory.create(createInput);
+				const earlyClose = childClosing.bind(created);
 				if (settled) {
-					await created.dispose().catch(() => undefined);
+					try { if (created.beginClose) await earlyClose; } catch (failure) { recordFinalizationError(failure); }
+					try { await created.dispose(); } catch (failure) { recordFinalizationError(failure); }
 					return;
 				}
 				session = created;
+				if (childClosing.reason !== undefined) {
+					abortChild(childClosing.reason);
+					settle(undefined, true);
+					return;
+				}
 				if (created.contextWindow !== undefined) input.onContextWindow?.(created.contextWindow);
 				const steer = created.steer.bind(created);
 				const followUp = created.followUp.bind(created);

@@ -47,7 +47,7 @@ it("reports rejected and missing acknowledgements without reopening or suppressi
 	assert.equal(child.close("completed"), close);
 });
 
-function fixture() {
+function fixture(startup?: Promise<void>) {
 	const managers: object[] = [];
 	const shutDown: object[] = [];
 	const disposed: object[] = [];
@@ -58,7 +58,7 @@ function fixture() {
 		DefaultResourceLoader: class { async reload() {} },
 		SessionManager: { inMemory: () => { const manager = {}; managers.push(manager); return manager; } },
 		createAgentSession: async ({ sessionManager }: { sessionManager: object }) => ({ session: {
-			bindExtensions: async () => { bound.push(getNativeChildLifecycle(sessionManager)); },
+			bindExtensions: async () => { bound.push(getNativeChildLifecycle(sessionManager)); await startup; },
 			extensionRunner: { hasHandlers: () => true, emit: async () => { shutDown.push(sessionManager); } },
 			dispose() { disposed.push(sessionManager); }, subscribe: () => () => {},
 			prompt: async () => {}, abort: async () => {}, steer: async () => {}, followUp: async () => {},
@@ -126,3 +126,28 @@ it("factory disposal seals all attached children before it waits, and leaves det
 	assert.deepEqual(f.disposed, [f.managers[0]]);
 	await detached.dispose();
 });
+
+for (const cause of ["stopped", "disposed"] as const) {
+	it(`seals a child still inside extension startup on ${cause}`, async () => {
+		const startup = Promise.withResolvers<void>();
+		const ack = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		const f = fixture(startup.promise);
+		const creation = f.factory.create({ ...f.launch, signal: controller.signal });
+		await new Promise((resolve) => setImmediate(resolve));
+		const lifecycle = f.bound[0]!;
+		assert.ok(lifecycle);
+		lifecycle.bindHost({ id: "runner", beforeClose: () => ack.promise });
+		const disposal = cause === "disposed" ? f.factory.dispose() : undefined;
+		if (cause === "stopped") controller.abort(cause);
+		assert.equal(lifecycle.closingSignal.aborted, true);
+		assert.equal(lifecycle.closingSignal.reason.reason, cause);
+		startup.resolve();
+		await Promise.resolve();
+		assert.deepEqual(f.disposed, []);
+		ack.resolve();
+		await assert.rejects(creation, cause === "disposed" ? /factory was disposed/ : /cancelled/);
+		await disposal;
+		assert.deepEqual(f.disposed, [f.managers[0]]);
+	});
+}

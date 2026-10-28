@@ -10,7 +10,7 @@ The version-1 handle has an opaque `generation`, execution `state`, `closingSign
 it is not a credential or a child selector. Duplicate ids and binding after closing throw.
 Module reloads in the same process share the manager-to-lifecycle registry.
 
-At foreground final completion and direct child/factory disposal, the package snapshots all
+At foreground/background terminal decisions and direct child/factory disposal, the package snapshots all
 host participants and establishes one joinable close operation, then synchronously aborts
 `closingSignal`. Every captured `beforeClose` callback is awaited before final command drain
 or extension shutdown. Unbinding starts closing; unbinding or reentrant disposal after the
@@ -24,12 +24,18 @@ the execution lifecycle after the acknowledgement barrier settles, including fai
 it does not assert successful remote invalidation or physical resource disposal.
 No host bindings means ordinary standalone completion needs no external acknowledgement.
 
+The first cause is retained: `completed`, `fatal`, `disposed`, `stopped`, `cancelled`,
+`interrupted`, `timeout`, `tool-timeout`, or `hard-timeout`. Stop, cancellation and timeout
+seal synchronously before aborting the SDK session; abort waits for the acknowledgement
+barrier to settle. A child still in startup observes the launch signal; a child returned
+after cancellation closes under the retained cause and is disposed without being prompted.
+Cleanup errors enter the terminal result until it is returned; later failures are handled
+and logged without changing an already-returned result.
+
 The host must use the synchronous signal at its actual execution boundary and revoke the
 matching runner scope in `beforeClose`. This notification does not implement a tool sandbox,
 runner revocation, pending-approval cancellation, usage accounting or process-exit detection.
 It grants no permission. Already executing calls may settle under the host's policy.
 
-This first slice covers foreground final completion and disposal. Stop, cancellation and
-timeout before final completion, background final settlement, nested/resumed recipes and
-exact detached process exit still require separate integration and real-runtime proof.
-Do not enable restricted delegation based on this package slice alone.
+Real SDK/runner integration, nested/resumed recipes and exact detached process exit still
+require separate proof. Do not enable restricted delegation based on package unit tests alone.

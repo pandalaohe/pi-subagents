@@ -41,6 +41,8 @@ afterEach(() => {
 
 function tempDir(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-orca-tabs-test-"));
+	// Keep observer manifests and sequence counters inside this fixture even below a real repository.
+	fs.mkdirSync(path.join(dir, ".git"));
 	tempDirs.push(dir);
 	return dir;
 }
@@ -257,7 +259,6 @@ test("enabled tabs use a worktree sequence and successful Pi sessions get cleanu
 	const capture = path.join(dir, "capture.json");
 	const secondCapture = path.join(dir, "capture-2.json");
 	const fakeOrca = writeCaptureOrca(dir);
-	fs.mkdirSync(path.join(dir, ".git"));
 	const runId = `progress-${Date.now()}`;
 	const tab = createOrcaProgressTab({
 		cwd: dir,
@@ -413,7 +414,6 @@ test("mirror output keeps small writes that hit stream backpressure before the b
 
 test("same-worktree Orca creates wait for the previous numbered tab", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
 	const dir = tempDir();
-	fs.mkdirSync(path.join(dir, ".git"));
 	const order = path.join(dir, "order.txt");
 	const firstCapture = path.join(dir, "first.json");
 	const secondCapture = path.join(dir, "second.json");
@@ -455,7 +455,6 @@ test("same-worktree Orca creates wait for the previous numbered tab", { skip: pr
 
 test("a missing predecessor marker does not delay the next tab", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
 	const dir = tempDir();
-	fs.mkdirSync(path.join(dir, ".git"));
 	const key = createHash("sha256").update(fs.realpathSync(dir)).digest("hex").slice(0, 20);
 	const progressRoot = path.join(TEMP_ROOT_DIR, "orca-progress");
 	fs.mkdirSync(progressRoot, { recursive: true, mode: 0o700 });
@@ -483,7 +482,6 @@ test("a missing predecessor marker does not delay the next tab", { skip: process
 
 test("queued same-worktree creates start their timeout when the predecessor becomes active", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
 	const dir = tempDir();
-	fs.mkdirSync(path.join(dir, ".git"));
 	const order = path.join(dir, "order.txt");
 	const active = path.join(dir, "active.lock");
 	const overlap = path.join(dir, "overlap.txt");
@@ -529,7 +527,6 @@ test("queued same-worktree creates start their timeout when the predecessor beco
 
 test("queued tabs defer cleanup until their terminal create settles", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
 	const dir = tempDir();
-	fs.mkdirSync(path.join(dir, ".git"));
 	const firstCapture = path.join(dir, "first.json");
 	const secondCapture = path.join(dir, "second.json");
 	const cleanupLog = path.join(dir, "cleanup.log");

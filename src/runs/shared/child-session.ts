@@ -15,7 +15,7 @@ import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult
 import { CHILD_COMMAND_TOOL, createChildCommandRuntime } from "./child-commands.ts";
 import { supervisorChannelDir } from "./child-tool-plan.ts";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
-import { createNativeChildLifecycle, type NativeCloseReason } from "./native-child-lifecycle.ts";
+import { createNativeChildLifecycle, nativeCloseReasonFromAbort, type NativeCloseReason } from "./native-child-lifecycle.ts";
 import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveHostPiPackageRoot } from "./pi-spawn.ts";
@@ -441,6 +441,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
 	let runtime: ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]> | undefined;
 	const live = new Set<ChildSession>();
+	const starting = new Set<ReturnType<typeof createNativeChildLifecycle>>();
 	/** Extension shutdowns still running for disposed children; `dispose()` waits for them. */
 	const shutdowns = new Set<Promise<void>>();
 	/** Launches still waiting for their MCP tools; `dispose()` ends the wait and waits for their shutdown. */
@@ -456,6 +457,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	return {
 		async create(launch) {
 			let nativeLifecycle: ReturnType<typeof createNativeChildLifecycle> | undefined;
+			let removeStartupAbort = () => {};
 			const disposalsAtStart = disposals;
 			const pi = await loadPiCodingAgent();
 			const builtinMcpTools = launch.builtinMcpTools ?? [];
@@ -532,12 +534,16 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					} catch (error) {
 						launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
 					} finally {
+							removeStartupAbort();
+							if (nativeLifecycle) starting.delete(nativeLifecycle);
 						session.dispose();
 					}
 				}
 			};
 			let inheritedProviders = new Set<string>();
 			const open = async () => {
+				launch.signal?.throwIfAborted();
+				if (disposals !== disposalsAtStart) throw new Error("The child session factory was disposed during startup.");
 				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
 				if (!resetExtensionCacheOnReload(loader) && (launch.ambientExtensions || launch.extensionPaths.length)) launch.onExtensionError?.({ extensionPath: "<loader>", event: "load", error: new Error("pi's extension cache reset is unavailable; extensions loaded into this child share module state with other sessions in this process.") });
@@ -572,7 +578,13 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
 				if (resolvedModel?.error) throw new Error(resolvedModel.error);
+				if (disposals !== disposalsAtStart) throw new Error("The child session factory was disposed during startup.");
 				nativeLifecycle = createNativeChildLifecycle(sessionManager);
+				starting.add(nativeLifecycle);
+				const closeOnAbort = () => { void nativeLifecycle!.close(nativeCloseReasonFromAbort(launch.signal?.reason)); };
+				launch.signal?.addEventListener("abort", closeOnAbort, { once: true });
+				removeStartupAbort = () => launch.signal?.removeEventListener("abort", closeOnAbort);
+				if (launch.signal?.aborted) { closeOnAbort(); await nativeLifecycle.close("cancelled"); launch.signal.throwIfAborted(); }
 				const { session } = await pi.createAgentSession({
 					cwd: launch.cwd,
 					agentDir,
@@ -604,6 +616,10 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				} finally {
 					binding = false;
 				}
+				if (launch.signal?.aborted) {
+					await shutdownSession(session);
+					throw new Error("The child launch was cancelled before startup completed.");
+				}
 				if (requiredStartupErrors.length > 0) {
 					// Binding finished, so the other extensions' session_start handlers ran and may hold resources.
 					await shutdownSession(session);
@@ -612,13 +628,17 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				return session;
 			};
 			const opened = loading.catch(() => {}).then(open).catch(async (error: unknown) => {
-				await nativeLifecycle?.close("fatal");
+				try { await nativeLifecycle?.close("fatal"); } finally { removeStartupAbort(); if (nativeLifecycle) starting.delete(nativeLifecycle); }
 				throw error;
 			});
 			loading = opened;
 			const session = await opened;
 			let pending: Promise<void> | undefined;
 			const shutdown = () => shutdownSession(session);
+			if (disposals !== disposalsAtStart) {
+				await shutdown();
+				throw new Error("The child session factory was disposed during startup.");
+			}
 			// Outside the launch lock: MCP servers connect after `session_start` without reading the per-launch env.
 			if (builtinMcp) {
 				const cancel = new AbortController();
@@ -646,7 +666,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				...(commands ? { finishCommands: () => commands.finish() } : {}),
 				steer: async (text) => { await session.steer(text); },
 				followUp: async (text) => { await session.followUp(text); },
-				abort: () => session.abort(),
+				abort: async () => { try { await nativeLifecycle!.close("cancelled"); } finally { await session.abort(); } },
 				hasQueuedMessages: () => session.agent?.hasQueuedMessages?.() === true,
 				dispose: () => {
 					if (!pending) {
@@ -667,15 +687,17 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get virtualModelId() { return session.model?.api === "pi-virtual" ? `${session.model.provider}/${session.model.id}` : undefined; },
 				get contextWindow() { return session.model?.contextWindow; },
 			};
+			starting.delete(nativeLifecycle!);
 			live.add(child);
 			return child;
 		},
 		async dispose() {
 			disposals += 1;
+			const startupCloses = [...starting].map((lifecycle) => lifecycle.close("disposed"));
 			for (const cancel of mcpWaits.keys()) cancel.abort();
 			const children = [...live].filter((child) => !child.detached);
 			for (const child of children) child.shutDown = true;
-			const closed = await Promise.allSettled(children.map((child) => child.beginClose?.("disposed")));
+			const closed = await Promise.allSettled([...startupCloses, ...children.map((child) => child.beginClose?.("disposed"))]);
 			await Promise.allSettled(children.map((child) => child.abort()));
 			const disposed = await Promise.allSettled([...children.map((child) => Promise.resolve().then(() => child.dispose())), ...shutdowns, ...mcpWaits.values()]);
 			if (live.size === 0) runtime = undefined;

@@ -123,6 +123,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./agents": "./src/api/agents.ts",
 		"./inspectors": "./src/api/inspectors.ts",
 		"./background-work": "./src/api/background-work.ts",
+		"./native-child-lifecycle": "./src/api/native-child-lifecycle.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
 		"./external-runs": "./src/api/external-runs.ts",
 		"./capability-ceiling": "./src/api/capability-ceiling.ts",
@@ -137,6 +138,9 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./project-panes": "./src/api/project-panes.ts",
 	});
 	const agents = await import("pi-subagents/agents");
+	const nativeChildLifecycle = await import("pi-subagents/native-child-lifecycle");
+	assert.equal(typeof nativeChildLifecycle.getNativeChildLifecycle, "function");
+	assert.equal(nativeChildLifecycle.getNativeChildLifecycle({}), undefined);
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_EVENT, "pi-subagents:runtime-agent-register:v1");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_VERSION, 1);
 	assert.equal(typeof agents.registerAgentViaEvents, "function");

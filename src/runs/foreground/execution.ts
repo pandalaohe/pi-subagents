@@ -108,6 +108,8 @@ import {
 import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../shared/child-launch.ts";
 import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
+import { createChildSessionClosing } from "../shared/child-session-closing.ts";
+import type { NativeCloseReason } from "../shared/native-child-lifecycle.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
@@ -578,10 +580,11 @@ async function runSingleAttempt(
 			console.warn(`[pi-subagents] Late foreground child cleanup failed after completion: ${message}`);
 			return;
 		}
-		result.error = finalizationError = message;
+		finalizationError = finalizationError === undefined || finalizationError === message ? message : `${finalizationError}\n${message}`;
+		result.error = finalizationError;
 		result.exitCode = 1;
 		progress.status = "failed";
-		progress.error = message;
+		progress.error = finalizationError;
 	};
 	const exitCode = await new Promise<number>((resolve) => {
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, { pause() {}, resume() {} });
@@ -590,6 +593,8 @@ async function runSingleAttempt(
 		let unsubscribe: (() => void) | undefined;
 		let sessionSettled = false;
 		let lifecycleFinished = false;
+		const childClosing = createChildSessionClosing();
+		let abortingChild: ChildSession | undefined;
 		let detached = false;
 		let hostStopReason: string | undefined;
 		let intercomStarted = false;
@@ -610,11 +615,16 @@ async function runSingleAttempt(
 			}
 		};
 		const startup = new AbortController();
-		const abortChild = (): void => {
+		const abortChild = (reason: NativeCloseReason = "fatal"): void => {
 			if (sessionSettled || lifecycleFinished) return;
-			startup.abort();
-			if (!session) return;
-			void session.abort().catch(() => {
+			const closing = childClosing.begin(reason);
+			startup.abort(childClosing.reason);
+			if (!session || abortingChild === session) return;
+			const child = abortingChild = session;
+			void closing.then(() => child.abort(), (error) => {
+				recordFinalizationError(error);
+				return child.abort();
+			}).catch(() => {
 				// The session settles through its prompt promise; abort failures are not separately actionable.
 			});
 		};
@@ -716,11 +726,12 @@ async function runSingleAttempt(
 					armFinalDrainTimer();
 					return;
 				}
+				void childClosing.begin("hard-timeout");
 				forcedTermination = true;
 				if (!cleanTerminalAssistantStopReceived && !agentSettledReceived && !assistantError) {
 					result.error = result.error ?? `Subagent session did not settle within ${FINAL_STOP_GRACE_MS}ms after its terminal event. Aborting it.`;
 				}
-				abortChild();
+				abortChild("hard-timeout");
 				finalHardFinishTimer = setTimeout(() => {
 					if (lifecycleFinished || sessionSettled) return;
 					settle(undefined, true);
@@ -776,10 +787,7 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (lifecycleFinished) return;
 			lifecycleFinished = true;
-			let closing: Promise<void> | undefined;
-			try { closing = session?.beginClose?.(code === 0 ? "completed" : "fatal"); }
-			catch (error) { closing = Promise.reject(error); }
-			void closing?.catch(() => {});
+			const closing = childClosing.begin(code === 0 ? "completed" : "fatal");
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearTimeoutTimers();
@@ -1033,6 +1041,7 @@ async function runSingleAttempt(
 			if (evt.type === "agent_start") {
 				const diagnostic = capture.toolDiagnostic();
 				if (diagnostic) {
+					void childClosing.begin("fatal");
 					const message = formatChildToolDiagnostic(diagnostic, { host: "parent" });
 					toolAvailabilityError = message;
 					result.error = message;
@@ -1238,6 +1247,7 @@ async function runSingleAttempt(
 		if (attemptTimeout) {
 			timeoutTimer = setTimeout(() => {
 				if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut) return;
+				void childClosing.begin("timeout");
 				result.timedOut = true;
 				timeoutCause = attemptTimeout.message;
 				clearAllToolTimeouts();
@@ -1247,7 +1257,7 @@ async function runSingleAttempt(
 				progress.error = attemptTimeout.message;
 				progress.durationMs = Date.now() - startTime;
 				fireUpdate();
-				abortChild();
+				abortChild("timeout");
 				timeoutHardFinishTimer = setTimeout(() => {
 					if (sessionSettled || lifecycleFinished) return;
 					settle(undefined, true);
@@ -1289,6 +1299,7 @@ async function runSingleAttempt(
 		};
 		const terminateForToolTimeout = (message: string): void => {
 			if (sessionSettled || lifecycleFinished || interruptedByControl || result.timedOut) return;
+			void childClosing.begin("tool-timeout");
 			clearTimeout(timeoutTimer);
 			result.timedOut = true;
 			timeoutCause = message;
@@ -1298,7 +1309,7 @@ async function runSingleAttempt(
 			progress.error = message;
 			progress.durationMs = Date.now() - startTime;
 			fireUpdate();
-			abortChild();
+			abortChild("tool-timeout");
 			toolTimeoutHardFinishTimer = setTimeout(() => {
 				if (sessionSettled || lifecycleFinished) return;
 				settle(undefined, true);
@@ -1328,6 +1339,7 @@ async function runSingleAttempt(
 		const settle = (promptError: unknown, forced = false): void => {
 			if (lifecycleFinished || sessionSettled) return;
 			sessionSettled = true;
+			void childClosing.begin(promptError !== undefined || result.error || assistantError ? "fatal" : "completed");
 			clearFinalDrainTimers();
 			const diagnostic = capture.toolDiagnostic();
 			const toolDiagnosticError = diagnostic ? formatChildToolDiagnostic(diagnostic, { host: "parent" }) : undefined;
@@ -1384,8 +1396,9 @@ async function runSingleAttempt(
 		if (options.signal) {
 			const kill = () => {
 				if (sessionSettled || lifecycleFinished) return;
+				void childClosing.begin(options.abortedAsStopped ? "stopped" : "cancelled");
 				abortedBySignal = true;
-				abortChild();
+				abortChild(options.abortedAsStopped ? "stopped" : "cancelled");
 				const hardTimer = setTimeout(() => {
 					if (sessionSettled || lifecycleFinished) return;
 					settle(undefined, true);
@@ -1403,6 +1416,7 @@ async function runSingleAttempt(
 			const interrupt = () => {
 				if (sessionSettled || lifecycleFinished) return;
 				if (result.timedOut) return;
+				void childClosing.begin("interrupted");
 				interruptedByControl = true;
 				clearTimeoutTimers();
 				clearAllToolTimeouts();
@@ -1412,7 +1426,7 @@ async function runSingleAttempt(
 				result.finalOutput = "Interrupted. Waiting for explicit next action.";
 				progress.activityState = undefined;
 				fireUpdate();
-				abortChild();
+				abortChild("interrupted");
 				const hardTimer = setTimeout(() => {
 					if (sessionSettled || lifecycleFinished) return;
 					settle(undefined, true);
@@ -1441,12 +1455,19 @@ async function runSingleAttempt(
 				const input = createReportedChildSessionInput(launch, shared.transcriptWriter);
 				input.signal = startup.signal;
 				const created = await childSessions.create(input);
+				const earlyClose = childClosing.bind(created);
 				if (lifecycleFinished) {
+					try { if (created.beginClose) await earlyClose; } catch (error) { recordFinalizationError(error); }
 					try { await created.dispose(); }
 					catch (error) { recordFinalizationError(error); }
 					return;
 				}
 				session = created;
+				if (childClosing.reason !== undefined) {
+					abortChild(childClosing.reason);
+					settle(undefined, true);
+					return;
+				}
 				const steer = created.steer.bind(created);
 				const followUp = created.followUp.bind(created);
 				created.steer = async (text) => {
@@ -1467,8 +1488,9 @@ async function runSingleAttempt(
 					followUp: (text) => created.followUp(text),
 					stop: (reason) => {
 						if (sessionSettled || lifecycleFinished) return;
+						void childClosing.begin("stopped");
 						hostStopReason = reason;
-						abortChild();
+						abortChild("stopped");
 					},
 				});
 				messageBaseline = created.messages.length;
