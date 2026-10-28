@@ -570,6 +570,7 @@ async function runSingleAttempt(
 	const childSessions = options.childSessionFactory ?? childSessionFactory();
 	const partialOutput = createPartialOutputTracker();
 	let childPromptFailed = false;
+	let finalizationError: string | undefined;
 	const exitCode = await new Promise<number>((resolve) => {
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, { pause() {}, resume() {} });
 		let session: ChildSession | undefined;
@@ -763,6 +764,10 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (lifecycleFinished) return;
 			lifecycleFinished = true;
+			let closing: Promise<void> | undefined;
+			try { closing = session?.beginClose?.(code === 0 ? "completed" : "fatal"); }
+			catch (error) { closing = Promise.reject(error); }
+			void closing?.catch(() => {});
 			clearFinalDrainTimers();
 			clearWatchdogTailTimer();
 			clearTimeoutTimers();
@@ -781,12 +786,17 @@ async function runSingleAttempt(
 			});
 			// Report the run only after the child's extensions have shut down.
 			void Promise.resolve().then(async () => {
-				if (code === 0 && !result.interrupted && !result.timedOut && !result.stopped && !abortedBySignal) {
-					try { await session?.finishCommands?.(); }
-					catch (error) { result.error = error instanceof Error ? error.message : String(error); code = 1; }
-				}
-				await session?.dispose();
-			}).catch(() => undefined).then(() => {
+				try {
+					await closing;
+					if (code === 0 && !result.interrupted && !result.timedOut && !result.stopped && !abortedBySignal) {
+						try { await session?.finishCommands?.(); }
+						catch (error) { result.error = error instanceof Error ? error.message : String(error); code = 1; }
+					}
+				} finally { await session?.dispose(); }
+			}).catch((error) => {
+				result.error = finalizationError = error instanceof Error ? error.message : String(error);
+				code = 1;
+			}).then(() => {
 				resolve(code);
 			});
 		};
@@ -1461,7 +1471,7 @@ async function runSingleAttempt(
 	if (afterCompactionSettlement) {
 		(result as AbortRecoverySingleResult)[AFTER_COMPACTION_SETTLEMENT] = true;
 	}
-	if (interruptedByControl) {
+	if (interruptedByControl && finalizationError === undefined) {
 		result.exitCode = 0;
 		result.interrupted = true;
 		result.error = undefined;

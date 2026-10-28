@@ -9,6 +9,7 @@
   "exports": {
     ".": "./index.ts",
     "./background-work": "./src/api/background-work.ts",
+    "./native-child-lifecycle": "./src/api/native-child-lifecycle.ts",
     "./external-job-provider": "./src/api/external-job-provider.ts",
     "./external-runs": "./src/api/external-runs.ts",
     "./agents": "./src/api/agents.ts",

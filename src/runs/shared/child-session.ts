@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionContext, ToolCallEvent, ToolCallEventResult
 import { CHILD_COMMAND_TOOL, createChildCommandRuntime } from "./child-commands.ts";
 import { supervisorChannelDir } from "./child-tool-plan.ts";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
+import { createNativeChildLifecycle, type NativeCloseReason } from "./native-child-lifecycle.ts";
 import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveHostPiPackageRoot } from "./pi-spawn.ts";
@@ -108,6 +109,8 @@ export interface ChildSession {
 	steer(text: string): Promise<void>;
 	followUp(text: string): Promise<void>;
 	abort(): Promise<void>;
+	/** Seals native execution synchronously, then awaits host invalidation before final drain. */
+	beginClose?(reason: NativeCloseReason): Promise<void>;
 	/** Emits `session_shutdown` to the child's extensions and disposes the session; resolves once that shutdown work is done. */
 	dispose(): Promise<void>;
 	/** Final settlement check for commands owned by this child; unfinished commands are cancelled and reject completion. */
@@ -452,6 +455,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	};
 	return {
 		async create(launch) {
+			let nativeLifecycle: ReturnType<typeof createNativeChildLifecycle> | undefined;
 			const disposalsAtStart = disposals;
 			const pi = await loadPiCodingAgent();
 			const builtinMcpTools = launch.builtinMcpTools ?? [];
@@ -517,15 +521,19 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			// watchers, servers, and timers. Do the same, then dispose.
 			const shutdownSession = async (session: Awaited<ReturnType<PiCodingAgentModule["createAgentSession"]>>["session"]): Promise<void> => {
 				try {
-					await commands?.shutdown();
-					const runner = session.extensionRunner;
-					if (runner.hasHandlers("session_shutdown")) {
-						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
-					}
-				} catch (error) {
-					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
+					await nativeLifecycle?.close("disposed");
 				} finally {
-					session.dispose();
+					try {
+						await commands?.shutdown();
+						const runner = session.extensionRunner;
+						if (runner.hasHandlers("session_shutdown")) {
+							await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
+						}
+					} catch (error) {
+						launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
+					} finally {
+						session.dispose();
+					}
 				}
 			};
 			let inheritedProviders = new Set<string>();
@@ -564,6 +572,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					? pi.resolveCliModel({ cliModel: launch.model, modelRuntime })
 					: undefined;
 				if (resolvedModel?.error) throw new Error(resolvedModel.error);
+				nativeLifecycle = createNativeChildLifecycle(sessionManager);
 				const { session } = await pi.createAgentSession({
 					cwd: launch.cwd,
 					agentDir,
@@ -590,7 +599,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						},
 					});
 				} catch (error) {
-					session.dispose();
+					try { await nativeLifecycle.close("fatal"); } finally { await shutdownSession(session); }
 					throw error;
 				} finally {
 					binding = false;
@@ -602,7 +611,10 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				}
 				return session;
 			};
-			const opened = loading.catch(() => {}).then(open);
+			const opened = loading.catch(() => {}).then(open).catch(async (error: unknown) => {
+				await nativeLifecycle?.close("fatal");
+				throw error;
+			});
 			loading = opened;
 			const session = await opened;
 			let pending: Promise<void> | undefined;
@@ -628,6 +640,7 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				try { await ready; } finally { mcpWaits.delete(cancel); }
 			}
 			const child: ChildSession = {
+				beginClose: (reason) => nativeLifecycle!.close(reason),
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
 				prompt: (text) => session.prompt(text),
 				...(commands ? { finishCommands: () => commands.finish() } : {}),
@@ -638,10 +651,11 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				dispose: () => {
 					if (!pending) {
 						live.delete(child);
-						const shutdownDone = shutdown();
-						pending = shutdownDone;
+						const shutdownDone = pending = Promise.resolve().then(shutdown);
 						shutdowns.add(shutdownDone);
-						void shutdownDone.finally(() => shutdowns.delete(shutdownDone));
+						void shutdownDone.then(() => shutdowns.delete(shutdownDone), () => shutdowns.delete(shutdownDone));
+						// Publish disposal before the synchronous signal can reenter it.
+						void nativeLifecycle!.close("disposed");
 					}
 					return pending;
 				},
@@ -661,12 +675,12 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			for (const cancel of mcpWaits.keys()) cancel.abort();
 			const children = [...live].filter((child) => !child.detached);
 			for (const child of children) child.shutDown = true;
+			const closed = await Promise.allSettled(children.map((child) => child.beginClose?.("disposed")));
 			await Promise.allSettled(children.map((child) => child.abort()));
-			for (const child of children) {
-				try { void child.dispose(); } catch { /* best effort */ }
-			}
-			await Promise.allSettled([...shutdowns, ...mcpWaits.values()]);
+			const disposed = await Promise.allSettled([...children.map((child) => Promise.resolve().then(() => child.dispose())), ...shutdowns, ...mcpWaits.values()]);
 			if (live.size === 0) runtime = undefined;
+			const failures = [...closed, ...disposed].filter((result) => result.status === "rejected");
+			if (failures.length) throw new AggregateError(failures.map((result) => result.reason), "Child invalidation unconfirmed during factory disposal.");
 		},
 	};
 }
