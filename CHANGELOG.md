@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore subagent tools after an extension unload followed by a compaction checkpoint; preserve deliberate exclusions. Backported from upstream #3200.
+
 ## [0.80.0] - 2026-10-21
 
 ### Highlights
